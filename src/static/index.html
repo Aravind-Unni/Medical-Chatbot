@@ -1,30 +1,22 @@
 <!DOCTYPE HTML>
 <html>
     <head>
-        <title>Document Q&A Chatbot</title>
+        <title>Medical Q&A Chatbot</title>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
         <link rel="stylesheet" href="static/assets/css/main.css" />
         <noscript><link rel="stylesheet" href="static/assets/css/noscript.css" /></noscript>
         <style>
-            /* Upload section styling */
-            .upload-section {
-                background: rgba(255, 255, 255, 0.05);
-                padding: 15px;
-                border-radius: 8px;
-                margin-bottom: 20px;
-                text-align: center;
-                border: 1px solid rgba(255, 255, 255, 0.1);
-                transition: all 0.3s ease;
-            }
-            #upload-status {
-                margin-top: 10px;
-                font-size: 0.9em;
-                font-weight: bold;
-            }
             /* Class to hide elements cleanly */
             .hidden {
                 display: none !important;
+            }
+            .chat-wrapper {
+                margin-top: 20px;
+                background: rgba(255, 255, 255, 0.05);
+                padding: 20px;
+                border-radius: 8px;
+                border: 1px solid rgba(255, 255, 255, 0.1);
             }
         </style>
     </head>
@@ -33,28 +25,19 @@
         <div id="wrapper">
             <header id="header">
                 <div class="logo">
-                    <span class="icon fa-file-pdf"></span>
+                    <span class="icon fa-user-md"></span>
                 </div>
                 <div class="content">
                     <div class="inner">
-                        <h1>Document Assistant</h1>
-                        <p id="header-desc">Upload any PDF document and ask questions about its content.</p>
+                        <h1>Medical Knowledge Assistant</h1>
+                        <p id="header-desc">Ask clinical questions based on the initialized medical database.</p>
                         
-                        <div class="upload-section" id="upload-container">
-                            <input type="file" id="pdf-file" accept="application/pdf" style="display: none;" onchange="updateFileName()" />
-                            <label for="pdf-file" class="button" style="cursor: pointer; margin-right: 10px;">Choose PDF</label>
-                            <span id="file-name" style="margin-right: 15px;">No file chosen</span>
-                            
-                            <button onclick="uploadPDF()" id="upload-btn" class="button primary" disabled>Upload & Process</button>
-                            <div id="upload-status"></div>
-                        </div>
-                        
-                        <div class="chat-wrapper hidden" id="chat-interface">
+                        <div class="chat-wrapper" id="chat-interface">
                             <div id="chat-box" class="chat-box">
                                 </div>
                             
                             <div class="input-area">
-                                <input type="text" id="user-input" placeholder="Type your question..." autocomplete="off" onkeydown="if(event.key==='Enter') sendMessage()">
+                                <input type="text" id="user-input" placeholder="Type your medical question..." autocomplete="off" onkeydown="if(event.key==='Enter') sendMessage()">
                                 <button onclick="sendMessage()" class="send-btn">Send</button>
                             </div>
                         </div>
@@ -63,7 +46,7 @@
                 </div>
                 <nav>
                     <ul>
-                        <li><a href="javascript:location.reload()">Start Over</a></li>
+                        <li><a href="javascript:location.reload()">Start New Session</a></li>
                     </ul>
                 </nav>
             </header>
@@ -71,7 +54,7 @@
             <div id="main"></div>
 
             <footer id="footer">
-                <p class="copyright">&copy; RAG Project. Design: <a href="https://html5up.net">HTML5 UP</a>.</p>
+                <p class="copyright">&copy; Medical RAG Project. Design: <a href="https://html5up.net">HTML5 UP</a>.</p>
             </footer>
         </div>
 
@@ -84,68 +67,15 @@
         <script src="static/assets/js/main.js"></script>
 
         <script>
-            // --- File Selection UI ---
-            function updateFileName() {
-                const fileInput = document.getElementById('pdf-file');
-                const fileNameDisplay = document.getElementById('file-name');
-                const uploadBtn = document.getElementById('upload-btn');
-                
-                if (fileInput.files.length > 0) {
-                    fileNameDisplay.textContent = fileInput.files[0].name;
-                    uploadBtn.disabled = false;
-                } else {
-                    fileNameDisplay.textContent = "No file chosen";
-                    uploadBtn.disabled = true;
-                }
-            }
+            // --- Session Management ---
+            // Generate a unique session ID for this user when the page loads.
+            // This ensures Supabase tracks this specific conversation accurately.
+            const sessionId = 'session-' + Math.random().toString(36).substring(2, 15) + Date.now().toString(36);
 
-            // --- File Upload Logic ---
-            async function uploadPDF() {
-                const fileInput = document.getElementById('pdf-file');
-                const statusDiv = document.getElementById('upload-status');
-                const uploadBtn = document.getElementById('upload-btn');
-                const file = fileInput.files[0];
-
-                if (!file) return;
-
-                const formData = new FormData();
-                formData.append("file", file);
-
-                statusDiv.innerText = "⏳ Uploading and processing... This might take a minute.";
-                statusDiv.style.color = "#ffb000";
-                uploadBtn.disabled = true;
-                fileInput.disabled = true;
-
-                try {
-                    const response = await fetch('/api/upload', {
-                        method: 'POST',
-                        body: formData
-                    });
-
-                    const data = await response.json();
-
-                    if (response.ok) {
-                        // SUCCESS! Hide the upload box and show the chat box
-                        document.getElementById('upload-container').style.display = 'none';
-                        document.getElementById('header-desc').style.display = 'none';
-                        document.getElementById('chat-interface').classList.remove('hidden');
-                        
-                        // Add the welcoming message
-                        addMessage(`System: Successfully loaded ${file.name}. What would you like to know?`, 'bot-message');
-                    } else {
-                        statusDiv.innerText = "❌ Error: " + data.detail;
-                        statusDiv.style.color = "#ff0000";
-                        uploadBtn.disabled = false;
-                        fileInput.disabled = false;
-                    }
-                } catch (error) {
-                    statusDiv.innerText = "❌ Failed to connect to the server.";
-                    statusDiv.style.color = "#ff0000";
-                    uploadBtn.disabled = false;
-                    fileInput.disabled = false;
-                    console.error(error);
-                }
-            }
+            // Greet the user automatically on page load
+            window.onload = function() {
+                addMessage("System: The Medical Knowledge Base is ready. How can I assist you today?", 'bot-message');
+            };
 
             // --- Chat Logic ---
             async function sendMessage() {
@@ -154,20 +84,30 @@
 
                 if (!question) return;
 
+                // Lock input while processing
+                inputField.disabled = true;
+
                 addMessage(question, 'user-message');
                 inputField.value = ''; 
 
-                const loadingId = addMessage('Thinking...', 'bot-message');
+                const loadingId = addMessage('Searching medical literature...', 'bot-message');
 
                 try {
                     const response = await fetch('/api/ask', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ query: question })
+                        // Pass both the query and the unique session ID to the backend
+                        body: JSON.stringify({ 
+                            query: question,
+                            session_id: sessionId
+                        })
                     });
 
                     const data = await response.json();
-                    document.getElementById(loadingId).remove();
+                    
+                    // Safely remove the thinking bubble
+                    const loadingElement = document.getElementById(loadingId);
+                    if (loadingElement) loadingElement.remove();
                     
                     if (response.ok) {
                         addMessage(data.answer, 'bot-message');
@@ -176,17 +116,28 @@
                     }
 
                 } catch (error) {
-                    document.getElementById(loadingId).remove();
+                    const loadingElement = document.getElementById(loadingId);
+                    if (loadingElement) loadingElement.remove();
+                    
                     addMessage("Could not connect to the server.", 'bot-message');
                     console.error(error);
+                } finally {
+                    // Unlock input
+                    inputField.disabled = false;
+                    inputField.focus();
                 }
             }
 
+            // --- UI Rendering ---
             function addMessage(text, className) {
                 const chatBox = document.getElementById('chat-box');
                 const div = document.createElement('div');
                 div.className = `message ${className}`;
-                div.id = 'msg-' + Date.now();
+                
+                // Random string generator to guarantee the ID is 100% unique
+                const uniqueId = Math.random().toString(36).substring(2, 11);
+                div.id = 'msg-' + Date.now() + '-' + uniqueId; 
+                
                 div.innerText = text;
                 chatBox.appendChild(div);
                 chatBox.scrollTop = chatBox.scrollHeight; 

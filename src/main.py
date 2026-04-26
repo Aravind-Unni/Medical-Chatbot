@@ -1,100 +1,86 @@
 import uvicorn
 import os
-import shutil
-from fastapi import FastAPI, Request, HTTPException, UploadFile, File
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
-from rag_engine import initialize_rag_pipeline
+from pydantic import BaseModel, Field
 
-# Initialize App
+# Import the newly updated engine
+from rag_engine import initialize_medical_rag_pipeline
+from database import add_message, get_chat_history
+
 app = FastAPI()
 
-# Mount Static Folder (This serves CSS/JS/Images)
+# Ensure the static directory exists before mounting
+if not os.path.exists("static"):
+    os.makedirs("static")
+
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# Create a directory to temporarily store uploaded PDFs
-UPLOAD_DIR = "uploaded_docs"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-# Global variable for the compiled LangGraph application
 rag_app = None
 
-# --- Data Models ---
 class QueryRequest(BaseModel):
     query: str
+    session_id: str = Field(default="default-session")
 
-# --- Routes ---
+@app.on_event("startup")
+async def startup_event():
+    global rag_app
+    print("⚙️ Booting up Medical RAG Server...")
+
+    try:
+        # This initializes the pipeline (Chroma, BM25, Reranker, and Gemini)
+        rag_app = initialize_medical_rag_pipeline()
+        print("✅ Server successfully connected to Medical Databases!")
+        
+    except Exception as e:
+        print(f"❌ Critical Error during Pipeline Setup: {e}")
+        rag_app = None
 
 @app.get("/")
 async def index():
-    # This serves your Chatbot Interface
     return FileResponse('static/index.html')
-
-@app.post("/api/upload")
-async def upload_pdf(file: UploadFile = File(...)):
-    """
-    Endpoint to receive a PDF, save it, and build the LangGraph RAG pipeline.
-    """
-    global rag_app
-    
-    # Basic validation
-    if not file.filename.lower().endswith('.pdf'):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
-        
-    file_path = os.path.join(UPLOAD_DIR, file.filename)
-    
-    try:
-        # 1. Save the uploaded file locally
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-            
-        print(f"📄 Saved {file.filename}. Initializing LangGraph workflow...")
-        
-        # 2. Build the LangGraph app using the newly uploaded file
-        rag_app = initialize_rag_pipeline(file_path)
-        
-        return {"message": f"Successfully processed {file.filename}. You can now ask questions!"}
-        
-    except Exception as e:
-        print(f"❌ Upload Error: {str(e)}")
-        return JSONResponse(status_code=500, content={"detail": f"Failed to process PDF: {str(e)}"})
 
 @app.post("/api/ask")
 async def ask_question(request: QueryRequest):
     global rag_app
     if not rag_app:
-        raise HTTPException(status_code=400, detail="Please upload a PDF document first before asking questions.")
+        raise HTTPException(
+            status_code=500,
+            detail="The Medical Knowledge Base failed to initialize. Please check the server logs."
+        )
     
     try:
-        print(f"📝 Received Query: {request.query}")
+        session_id = request.session_id
+        print(f"📝 Received Clinical Query [{session_id}]: {request.query}")
         
-        # --- THE FIX: LangGraph State Dictionary requires the "question" key ---
-        initial_state = {"question": request.query}
+        # Retrieve recent history from your database module
+        chat_history = get_chat_history(session_id, limit=6)
         
-        # Run the LangGraph application. It returns the final state snapshot.
-        final_state = rag_app.invoke(initial_state)
+        # Prepare the state for the RAG Pipeline
+        initial_state = {
+            "original_question": request.query,
+            "chat_history": chat_history,
+            "session_id": session_id
+        }
         
-        # Extract the final answer from the updated state
-        answer = final_state.get("generation", "I couldn't generate an answer based on the current context.")
+        # Invoke the pipeline
+        result = rag_app.invoke(initial_state)
+        answer = result.get("generation", "I couldn't generate an answer based on the current context.")
         
-        # --- NEW: Extracting sources based on LangGraph State ---
-        used_tools = []
-        # If the state flag for web search was flipped to True, it used Tavily
-        if final_state.get("web_search_required"):
-            used_tools.append("Tavily Web Search")
-        # Otherwise, if there are documents in the state, it used the local PDF
-        elif final_state.get("documents"):
-            used_tools.append("Local PDF Document")
-        else:
-            used_tools.append("Agent Internal Knowledge")
+        # Log the interaction to the database
+        add_message(session_id, "User", request.query)
+        add_message(session_id, "Assistant", answer)
+        
+        # Determine source status for UI display
+        used_tools = ["Medical Knowledge Base (Hybrid Search & Reranked)"] if result.get("documents") else ["No medical literature found for this query"]
             
         return {"answer": answer, "sources": used_tools}
     
     except Exception as e:
-        print(f"❌ Error: {str(e)}")
+        print(f"❌ Error during request processing: {str(e)}")
         return JSONResponse(status_code=500, content={"detail": str(e)})
 
 if __name__ == "__main__":
+    # Note: 'main:app' assumes this file is named main.py
     uvicorn.run("main:app", host='0.0.0.0', port=8000, reload=True)
-    

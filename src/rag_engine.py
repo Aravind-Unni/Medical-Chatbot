@@ -1,223 +1,189 @@
 import os
-from typing import TypedDict, List, Literal
-from pydantic import BaseModel, Field
+import pickle
 from dotenv import load_dotenv
 
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+# Embeddings & Vector Stores
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
-from langchain_huggingface import HuggingFaceEmbeddings 
-from langchain_groq import ChatGroq
-from langchain_community.tools.tavily_search import TavilySearchResults
-from langchain_community.utilities.tavily_search import TavilySearchAPIWrapper
-from langchain_core.prompts import PromptTemplate
-from langchain_core.documents import Document
 
-# LangGraph Imports
-from langgraph.graph import StateGraph, START, END
+# Sparse Retriever
+from langchain_community.retrievers import BM25Retriever
+
+from sentence_transformers import CrossEncoder
+
+# LLM & Prompts (Google GenAI / Gemma)
+from langchain_groq import ChatGroq
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_nvidia_ai_endpoints import NVIDIARerank
+# Langfuse
+from langfuse.langchain import CallbackHandler
+from langfuse import get_client
+
+# --- IMPORT YOUR PREPROCESSOR ---
+from rag_preprocess import preprocess_and_index
 
 load_dotenv()
 
-COLLECTION_NAME = "dynamic_policies"
-EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+# --- CONSTANTS & PATHS ---
+COLLECTION_NAME = "medical_knowledge_hybrid"
+EMBEDDING_MODEL_NAME = "pritamdeka/S-PubMedBert-MS-MARCO"
+RERANKER_MODEL_NAME = "nvidia/llama-nemotron-rerank-1b-v2"
 
-# ==========================================
-# 1. Define the State & Schemas
-# ==========================================
-class GraphState(TypedDict):
-    question: str
-    documents: List[Document]
-    generation: str
-    web_search_required: bool
-    retrieval_attempts: int
+BASE_DIR = r"C:/RAG_Medical"
+TARGET_PDF_DIR = os.path.join(BASE_DIR, "data")
+CHROMA_PERSIST_DIR = os.path.join(BASE_DIR, "chroma_db")
+BM25_SAVE_PATH = os.path.join(BASE_DIR, "bm25_retriever.pkl")
 
-class GradeDocuments(BaseModel):
-    """Binary score for relevance check on retrieved documents."""
-    binary_score: Literal["yes", "no"] = Field(
-        ..., description="Documents are relevant to the question, 'yes' or 'no'"
-    )
 
-def initialize_rag_pipeline(file_path):
-    print(f"📄 Loading PDF from {file_path}...")
-    loader = PyPDFLoader(file_path)
-    docs = loader.load()
+class MedicalRAGPipeline:
+    def __init__(self, chroma_retriever, bm25_retriever, cross_encoder, prompt, llm):
+        self.chroma_retriever = chroma_retriever
+        self.bm25_retriever = bm25_retriever
+        self.cross_encoder = cross_encoder 
+        self.prompt = prompt
+        self.llm = llm
+        self.langfuse_client = get_client()
+
+    def retrieve_and_rerank(self, query, top_k=5):
+        print(f"🔍 Searching Medical Knowledge Base for: '{query}'")
+        dense_docs = self.chroma_retriever.invoke(query)
+        sparse_docs = self.bm25_retriever.invoke(query)
+        
+        # Deduplicate the results
+        unique_docs = {}
+        for doc in dense_docs + sparse_docs:
+            if doc.page_content not in unique_docs:
+                unique_docs[doc.page_content] = doc
+                
+        doc_list = list(unique_docs.values())
+        if not doc_list:
+            return ""
+            
+        print(f"⚖️ Reranking {len(doc_list)} medical snippets...")
+        
+        # --- THE FIX: Use NVIDIA's built-in LangChain compressor ---
+        reranked_docs = self.cross_encoder.compress_documents(
+            query=query, 
+            documents=doc_list
+        )
+        
+        # Extract the results (NVIDIA already sorted them and limited to top_n)
+        top_docs = [f"[Source {i+1}]: {doc.page_content}" for i, doc in enumerate(reranked_docs[:top_k])]
+        
+        return "\n\n---\n\n".join(top_docs)
+
+    def invoke(self, state: dict):
+        original_question = state.get("original_question", "")
+        chat_history = state.get("chat_history", [])
+        session_id = state.get("session_id", "anonymous_session")
+        
+        langfuse_handler = CallbackHandler()
+        langfuse_config = {
+            "callbacks": [langfuse_handler],
+            "metadata": {
+                "langfuse_session_id": session_id,
+                "langfuse_tags": ["medical_rag_query"]
+            }
+        }
+        
+        if chat_history:
+            history_str = "\n".join([f"{msg['role']}: {msg['content']}" for msg in chat_history])
+            rewrite_sys = """Given the following patient conversation history and a follow-up medical question, rephrase the follow-up question to be a standalone query.
+            Do NOT answer the question, just reformulate it so it contains all the necessary medical context. If it's already standalone, return it exactly as is."""
+            rewrite_prompt = PromptTemplate.from_template(f"{rewrite_sys}\n\nChat History:\n{{history}}\n\nFollow-Up: {{question}}\nStandalone Search Query:")
+            rewrite_chain = rewrite_prompt | self.llm | StrOutputParser()
+            
+            search_query = rewrite_chain.invoke(
+                {"history": history_str, "question": original_question},
+                config=langfuse_config
+            )
+            print(f"🔄 Rewrote Medical Query to: {search_query}")
+        else:
+            search_query = original_question
+            history_str = "No previous history."
+            
+        context_str = self.retrieve_and_rerank(search_query)
+        
+        print("🤖 Generating Clinical Response...")
+        qa_chain = self.prompt | self.llm | StrOutputParser()
+        answer = qa_chain.invoke(
+            {"context": context_str, "chat_history": history_str, "question": original_question},
+            config=langfuse_config
+        )
+        
+        self.langfuse_client.flush()
+        return {"generation": answer, "documents": True if context_str else False}
+
+
+def initialize_medical_rag_pipeline():
+    print("🚀 Initializing Medical Pipeline...")
     
-    print(f"✂️ STEP 2: TEXT CHUNKING")
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=150)
-    all_chunks = text_splitter.split_documents(docs)
-    
-    print("🧠 Initializing local HuggingFace embedding model...")
-    # Using local CPU to avoid HuggingFace API cold starts and batch size limits
+    # --- THE AUTO-FALLBACK LOGIC ---
+    if not os.path.exists(CHROMA_PERSIST_DIR) or not os.path.exists(BM25_SAVE_PATH):
+        print("⚠️ Databases not found! Triggering automatic preprocessing...")
+        if not os.path.exists(TARGET_PDF_DIR):
+            raise FileNotFoundError(f"❌ Cannot build databases. PDF folder missing at: {TARGET_PDF_DIR}")
+        
+        # Call the function from your preprocessor script!
+        preprocess_and_index(TARGET_PDF_DIR)
+        print("🔄 Preprocessing complete. Resuming engine startup...")
+
+    print("🧠 Loading HuggingFace Embeddings...")
     embedding_model = HuggingFaceEmbeddings(
         model_name=EMBEDDING_MODEL_NAME,
-        model_kwargs={'device': 'cpu'}, 
+        model_kwargs={'device': 'cpu'},
         encode_kwargs={'normalize_embeddings': True}
     )
 
-    print("💾 Creating new Chroma vector store in memory...")
-    vector_store = Chroma.from_documents(
-        documents=all_chunks, embedding=embedding_model, collection_name=COLLECTION_NAME 
+    print("💾 Loading ChromaDB from disk...")
+    vector_store = Chroma(
+        collection_name=COLLECTION_NAME,
+        embedding_function=embedding_model,
+        persist_directory=CHROMA_PERSIST_DIR
     )
-    # Retrieving 6 chunks to give the Grader LLM plenty of context to evaluate
-    retriever = vector_store.as_retriever(search_kwargs={"k": 3})
-
-    print("🤖 Initializing Groq Agent Fleet...")
-    # Agent 1: Grader (Heavy logic to evaluate context accurately)
-    grader_llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
+    chroma_retriever = vector_store.as_retriever(search_kwargs={"k": 5})
     
-    # Agent 2: Rewriter (Creative semantic understanding for rephrasing)
-    rewriter_llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0.2)
+    print("💾 Loading BM25 Retriever from disk...")
+    with open(BM25_SAVE_PATH, "rb") as f:
+        bm25_retriever = pickle.load(f)
+
+    # 4. Initialize NVIDIA Reranker
+    print(f"⚖️ Initializing NVIDIA Reranker: {RERANKER_MODEL_NAME}...")
+    nvidia_api_key = os.getenv("NVIDIA_API_KEY")
+    if not nvidia_api_key:
+        raise ValueError("❌ NVIDIA_API_KEY not found in your .env file!")
+        
+    reranker = NVIDIARerank(
+        model=RERANKER_MODEL_NAME,
+        top_n=5,
+        truncate="END" # Automatically handles context limits cleanly
+    )
+
+    print("🤖 Initializing Gemma 3 Generator...")
+    llm = ChatGroq(
+        model="llama-3.3-70b-Versatile",
+        temperature=0.1
+    )
+
+    system_prompt = """You are an expert, objective AI medical assistant.
+    Your role is to extract and summarize information strictly from the provided medical literature/documents.
     
-    # Agent 3: Generator (Heavy synthesizer for writing the final answer)
-    generator_llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0.2)
+    CRITICAL MEDICAL GUARDRAILS:
+    1. STRICT ADHERENCE: Base your answers ONLY on the provided context. Do NOT use outside knowledge, guess, or infer clinical guidelines that are not explicitly stated.
+    2. NO DIAGNOSES: Never attempt to diagnose a patient, prescribe medication, or offer definitive treatment plans.
+    3. MISSING INFORMATION: If the answer is not contained in the provided text, you must explicitly state: "The provided medical documents do not contain information to answer this query."
 
-    print("🤖 Initializing Groq Agent Fleet...")
+    Previous Conversation History:
+    {chat_history}
+
+    Medical Context:
+    {context}
+
+    Patient/User Query: {question}
+    Clinical Response:"""
     
-
+    prompt = PromptTemplate.from_template(system_prompt)
     
-    print("🔌 Connecting Tavily API Key explicitly...")
-    tavily_key = os.environ.get("TAVILY_API_KEY") 
-    tavily_wrapper = TavilySearchAPIWrapper(tavily_api_key=tavily_key)
-    tavily_tool = TavilySearchResults(api_wrapper=tavily_wrapper, max_results=3)
-    
-
-    # ==========================================
-    # 2. Define the Nodes (The Workers)
-    # ==========================================
-    def retrieve(state: GraphState):
-        """Tool: Fetch from local ChromaDB"""
-        print("---RETRIEVE FROM CHROMA---")
-        question = state["question"]
-        attempts = state.get("retrieval_attempts", 0) + 1
-        documents = retriever.invoke(question)
-        return {"documents": documents, "retrieval_attempts": attempts}
-
-    def web_search(state: GraphState):
-        """Tool: Fetch from Tavily (Fallback)"""
-        print("---WEB SEARCH FALLBACK---")
-        question = state["question"]
-        
-        try:
-            # 1. Get the raw list of dictionaries from Tavily
-            raw_docs = tavily_tool.invoke({"query": question})
-            
-            # 2. Extract just the 'content' from each dictionary and join with double newlines
-            web_text = "\n\n".join([d.get("content", "") for d in raw_docs if isinstance(d, dict)])
-            
-            # Fallback just in case Tavily returns an unexpected format
-            if not web_text:
-                web_text = str(raw_docs)
-            
-            # 3. Create the Document using the joined string
-            web_results_doc = Document(page_content=web_text)
-            
-            return {"documents": [web_results_doc]}
-            
-        except Exception as e:
-            print(f"❌ Web Search Error parsing results: {e}")
-            # Prevent the graph from crashing by passing a dummy document
-            error_doc = Document(page_content="I attempted a web search but encountered an error parsing the data.")
-            return {"documents": [error_doc]}
-
-    def grade_documents(state: GraphState):
-        """Agent: Filter irrelevant chunks in a SINGLE call to avoid rate limits"""
-        print("---GRADE DOCUMENTS (BULK)---")
-        question = state["question"]
-        documents = state["documents"]
-        
-        context = "\n\n".join([f"Doc {i}: {d.page_content}" for i, d in enumerate(documents)])
-
-        
-        system = """You are a strict grader assessing relevance of retrieved documents to a user question. 
-        Look at the documents carefully. If they do NOT contain the actual answer or facts to address the question, respond with 'no'.
-        Respond with ONLY the word 'yes' if the answer is explicitly in the text, or 'no' if it is not."""
-        
-        response = grader_llm.invoke(f"{system}\n\nQuestion: {question}\n\nContext: {context}")
-        decision = response.content.strip().lower()
-
-
-        web_search_required = True if "no" in decision else False
-        
-        # If relevant, keep documents; if not, clear them to trigger rewrite
-        filtered_docs = documents if not web_search_required else []
-                
-        return {"documents": filtered_docs, "web_search_required": web_search_required}
-
-    def rewrite_query(state: GraphState):
-        """Agent: Formulate a better question"""
-        print("---REWRITE QUERY---")
-        question = state["question"]
-        
-        # --- THE FIX: Make the prompt extremely strict ---
-        system = """You are an expert question re-writer. Your job is to convert an input question into a better, highly targeted search query.
-        Look at the input and identify the core entity and intent.
-        CRITICAL RULE: You must respond with ONLY the new question. Do not include any preambles, conversational filler, or explanations."""
-        
-        rewrite_prompt = PromptTemplate.from_template(f"{system}\n\nInitial question: {question}\nImproved question:")
-        
-        chain = rewrite_prompt | rewriter_llm
-        better_question = chain.invoke({"question": question}).content.strip() # Strip removes accidental white spaces
-        
-        # Print this so you can see exactly what it's sending to Tavily!
-        print(f"🔄 Rewritten Query: {better_question}") 
-        
-        return {"question": better_question}
-
-    def generate(state: GraphState):
-        """Agent: Write the final answer"""
-        print("---GENERATE ANSWER---")
-        question = state["question"]
-        documents = state["documents"]
-        
-        system = """You are an assistant for question-answering tasks. Use the following pieces of retrieved context to answer the question. If you don't know the answer, just say that you don't know. Use three sentences maximum and keep the answer concise."""
-        prompt = PromptTemplate.from_template(f"{system}\n\nQuestion: {{question}} \nContext: {{context}} \nAnswer:")
-        
-        docs_text = "\n\n".join([d.page_content for d in documents])
-        chain = prompt | generator_llm
-        generation = chain.invoke({"context": docs_text, "question": question}).content
-        return {"generation": generation}
-
-    # ==========================================
-    # 3. Define the Routing Logic (The Edges)
-    # ==========================================
-    def decide_to_generate(state: GraphState):
-        """Edge: Implement Max 5 Retry Logic with Web Fallback"""
-        web_search_required = state["web_search_required"]
-        attempts = state.get("retrieval_attempts", 0)
-        
-        if web_search_required:
-            print(f"---EVALUATION: Docs irrelevant. Attempt {attempts} of 5---")
-            if attempts >= 2:
-                print("---MAX ATTEMPTS REACHED: FALLING BACK TO WEB SEARCH---")
-                return "web_search"
-            else:
-                print("---LOOPING BACK TO REWRITE---")
-                return "rewrite_query"
-        else:
-            print("---EVALUATION: Docs relevant. Proceeding to generation---")
-            return "generate"
-
-    # ==========================================
-    # 4. Compile the Graph
-    # ==========================================
-    print("🚀 Compiling LangGraph Workflow...")
-    workflow = StateGraph(GraphState)
-
-    # Add Nodes
-    workflow.add_node("retrieve", retrieve)
-    workflow.add_node("grade_documents", grade_documents)
-    workflow.add_node("rewrite_query", rewrite_query)
-    workflow.add_node("web_search", web_search)
-    workflow.add_node("generate", generate)
-
-    # Add Edges (Notice the direct flow from START to retrieve)
-    workflow.add_edge(START, "retrieve")
-    workflow.add_edge("retrieve", "grade_documents")
-    workflow.add_conditional_edges("grade_documents", decide_to_generate)
-    workflow.add_edge("rewrite_query", "retrieve")
-    workflow.add_edge("web_search", "generate")
-    workflow.add_edge("generate", END)
-
-    app = workflow.compile()
-    print("✅ LangGraph Ready.")
-    return app
+    print("✅ Advanced Medical RAG Pipeline Ready.")
+    return MedicalRAGPipeline(chroma_retriever, bm25_retriever, reranker, prompt, llm)
